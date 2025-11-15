@@ -5,6 +5,11 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from steam.utils.web import make_requests_session
 from steam.client.cdn import ContentServer, CDNDepotManifest, CDNClient
+from steam.core.crypto import symmetric_decrypt
+from binascii import crc32
+from zipfile import ZipFile
+from io import BytesIO
+import struct, lzma, zstandard
 
 CONTENT_SERVER_LIST = [
     "http://st.dl.bscstorage.net",
@@ -48,6 +53,40 @@ class MyCDNClient(CDNClient):
         resp = self.cdn_cmd('depot', '%s/manifest/%s/5/%s' % (depot_id, manifest_gid, manifest_request_code))
         manifest = self.DepotManifestClass(self, 0, resp.content)
         self.manifests.append(manifest)
+
+    def get_manifest_for_workshop_item(self, item_id):
+        data = {'itemcount': 1, 'publishedfileids[0]': item_id}
+        api_url = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
+        resp = requests.post(api_url, data=data)
+        details = resp.json()['response']['publishedfiledetails'][0]
+        app_id = depot_id = details['consumer_app_id']
+        manifest_gid = details['hcontent_file']
+        return self.get_manifest(app_id, depot_id, manifest_gid)
+
+    def get_chunk(self, app_id, depot_id, chunk_id):
+        if (depot_id, chunk_id) not in self._chunk_cache:
+            resp = self.cdn_cmd('depot', '%s/chunk/%s' % (depot_id, chunk_id))
+            data = symmetric_decrypt(resp.content, self.get_depot_key(app_id, depot_id))
+
+            if data[:3] == b'VZa':
+                vzfilter = lzma._decode_filter_properties(lzma.FILTER_LZMA1, data[7:12])
+                vzdec = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=[vzfilter])
+                checksum, decompressed_size = struct.unpack('<II', data[-10:-2])
+                data = vzdec.decompress(data[12:-9])[:decompressed_size]
+                if crc32(data) != checksum:
+                    raise ValueError("VZ: CRC32 checksum doesn't match for decompressed data")
+            elif data[:4] == b'VSZa':
+                zstd_dec = zstandard.ZstdDecompressor()
+                checksum, decompressed_size = struct.unpack('<II', data[-15:-7])
+                data = zstd_dec.decompress(data[8:-15])[:decompressed_size]
+                if crc32(data) != checksum:
+                    raise ValueError("VSZ: CRC32 checksum doesn't match for decompressed data")
+            else:
+                with ZipFile(BytesIO(data)) as zf:
+                    data = zf.read(zf.filelist[0])
+
+            self._chunk_cache[(depot_id, chunk_id)] = data
+        return self._chunk_cache[(depot_id, chunk_id)]
 
     def download_files(self, download_path, max_workers=8):
         errors = []
@@ -116,18 +155,24 @@ def main():
     parser_download_depot.add_argument('manifest_gid')
     parser_download_depot.add_argument('download_path', help='下载目录')
 
+    # download_workshop
+    parser_download_workshop = subparsers.add_parser('download_workshop')
+    parser_download_workshop.add_argument('item_id')
+    parser_download_workshop.add_argument('download_path', help='下载目录')
+
     client = MyCDNClient()
     args = parser.parse_args()
     if args.command == 'download':
         if not os.path.exists(args.manifest_path):
             print("manifest文件不存在:", args.manifest_path)
             exit(1)
-
         with open(args.manifest_path, "rb") as f:
             manifest = CDNDepotManifest(client, 0, f.read())
         client.manifests.append(manifest)
     elif args.command == 'download_depot':
         client.get_manifest(args.app_id, args.depot_id, args.manifest_gid)
+    elif args.command == 'download_workshop':
+        client.get_manifest_for_workshop_item(args.item_id)
 
     os.makedirs(args.download_path, exist_ok=True)
     client.download_files(args.download_path)
