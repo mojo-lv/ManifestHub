@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, json, threading, argparse
+import os, json, threading, argparse, requests
 from hashlib import sha1
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
@@ -11,6 +11,10 @@ CONTENT_SERVER_LIST = [
     "http://steampipe.steamcontent.tnkjmec.com",
     "http://alibaba.cdn.steampipe.steamcontent.com",
 ]
+
+def get_manifest_request_code(manifest_gid):
+    url = f"http://gmrc.openst.top/manifest/{manifest_gid}"
+    return requests.get(url).content.decode('utf-8')
 
 class MyCDNClient(CDNClient):
     def __init__(self):
@@ -38,6 +42,12 @@ class MyCDNClient(CDNClient):
             depot_key = depot_keys[str(depot_id)]
             self.depot_keys[depot_id] = bytes.fromhex(depot_key)
         return self.depot_keys[depot_id]
+
+    def get_manifest(self, app_id, depot_id, manifest_gid):
+        manifest_request_code = get_manifest_request_code(manifest_gid)
+        resp = self.cdn_cmd('depot', '%s/manifest/%s/5/%s' % (depot_id, manifest_gid, manifest_request_code))
+        manifest = self.DepotManifestClass(self, 0, resp.content)
+        self.manifests.append(manifest)
 
     def download_files(self, download_path, max_workers=8):
         errors = []
@@ -99,6 +109,13 @@ def main():
     parser_download.add_argument('manifest_path', help='manifest文件路径')
     parser_download.add_argument('download_path', help='下载目录')
 
+    # download_depot
+    parser_download_depot = subparsers.add_parser('download_depot')
+    parser_download_depot.add_argument('app_id')
+    parser_download_depot.add_argument('depot_id')
+    parser_download_depot.add_argument('manifest_gid')
+    parser_download_depot.add_argument('download_path', help='下载目录')
+
     client = MyCDNClient()
     args = parser.parse_args()
     if args.command == 'download':
@@ -109,9 +126,11 @@ def main():
         with open(args.manifest_path, "rb") as f:
             manifest = CDNDepotManifest(client, 0, f.read())
         client.manifests.append(manifest)
+    elif args.command == 'download_depot':
+        client.get_manifest(args.app_id, args.depot_id, args.manifest_gid)
 
-        os.makedirs(args.download_path, exist_ok=True)
-        client.download_files(args.download_path)
+    os.makedirs(args.download_path, exist_ok=True)
+    client.download_files(args.download_path)
 
 if __name__ == '__main__':
     main()
