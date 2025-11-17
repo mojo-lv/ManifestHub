@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 import os, json, threading, argparse, requests
+from pathlib import Path
 from hashlib import sha1
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
+
+import vdf
 from steam.utils.web import make_requests_session
 from steam.client.cdn import ContentServer, CDNDepotManifest, CDNClient
 from steam.core.crypto import symmetric_decrypt
+
 from binascii import crc32
 from zipfile import ZipFile
 from io import BytesIO
@@ -145,7 +149,7 @@ def main():
 
     # download
     parser_download = subparsers.add_parser('download')
-    parser_download.add_argument('manifest_path', help='manifest文件路径')
+    parser_download.add_argument('manifest_path', help='manifest文件或文件夹路径')
     parser_download.add_argument('download_path', help='下载目录')
 
     # download_depot
@@ -164,11 +168,33 @@ def main():
     args = parser.parse_args()
     if args.command == 'download':
         if not os.path.exists(args.manifest_path):
-            print("manifest文件不存在:", args.manifest_path)
+            print(args.manifest_path, "不存在!")
             exit(1)
-        with open(args.manifest_path, "rb") as f:
-            manifest = CDNDepotManifest(client, 0, f.read())
-        client.manifests.append(manifest)
+
+        if os.path.isfile(args.manifest_path):
+            with open(args.manifest_path, 'rb') as f:
+                manifest = CDNDepotManifest(client, 0, f.read())
+            client.manifests.append(manifest)
+
+        elif os.path.isdir(args.manifest_path):
+            manifest_paths = list(Path(args.manifest_path).glob("*.manifest"))
+            if not manifest_paths:
+                print(args.manifest_path, "目录下不存在.manifest文件")
+                exit(1)
+
+            for manifest_path in manifest_paths:
+                with open(manifest_path, 'rb') as f:
+                    manifest = CDNDepotManifest(client, 0, f.read())
+                client.manifests.append(manifest)
+
+            depot_keys_file = os.path.join(args.manifest_path, 'key.vdf')
+            if os.path.exists(depot_keys_file):
+                with open(depot_keys_file, 'r') as f:
+                    depots = vdf.load(f).get("depots", {})
+                    for depot_id in depots:
+                        depot_key = depots[depot_id]['DecryptionKey']
+                        client.depot_keys[int(depot_id)] = bytes.fromhex(depot_key)
+
     elif args.command == 'download_depot':
         client.get_manifest(args.app_id, args.depot_id, args.manifest_gid)
     elif args.command == 'download_workshop':
